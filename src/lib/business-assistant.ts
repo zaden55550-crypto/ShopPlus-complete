@@ -1,0 +1,28 @@
+import { z } from "zod";
+import { profitAndLoss } from "@/lib/accounting";
+import { floatBalances, purchaseTotals } from "@/lib/finance";
+import { performance, position } from "@/lib/summary";
+import type { ErpState } from "@/lib/erp";
+
+const row = z.object({ label: z.string().max(120), value: z.number().finite(), secondary: z.number().finite().optional() });
+const period = z.object({ label: z.string().max(40), from: z.number(), to: z.number(), sales: z.number(), purchases: z.number(), expenses: z.number(), grossSales: z.number(), salaries: z.number(), stockLosses: z.number(), profit: z.number(), grossProfit: z.number(), cogs: z.number(), returns: z.number(), transactions: z.number(), cash: z.number(), mpesa: z.number(), bank: z.number(), credit: z.number(), topProducts: z.array(row).max(12), expenseCategories: z.array(row).max(12) });
+export const assistantContextSchema = z.object({ definitions: z.string().max(1200), shop: z.string().max(100), currency: z.string().max(10), generatedAt: z.string().max(40), periods: z.array(period).max(16), position: z.object({ stock: z.number(), retail: z.number(), receivables: z.number(), payables: z.number(), payroll: z.number(), low: z.number(), out: z.number(), cashUpPending: z.boolean() }), accounts: z.object({ cash: z.number(), mpesa: z.number(), bank: z.number() }), products: z.array(z.object({ name: z.string().max(120), sku: z.string().max(80).optional(), qty: z.number(), buy: z.number(), sell: z.number(), minStock: z.number(), hasImage: z.boolean() })).max(1000), receivables: z.array(row).max(50), payables: z.array(row).max(50), employees: z.array(z.object({ name: z.string().max(100), role: z.string().max(80), active: z.boolean() })).max(100) });
+export const assistantRequestSchema = z.object({ messages: z.array(z.unknown()).max(60), language: z.string().max(40), page: z.string().max(120), context: assistantContextSchema });
+export type AssistantContext = z.infer<typeof assistantContextSchema>;
+
+const DEFINITIONS = "sales = net sales after returns; grossSales = before returns; grossProfit = grossSales - returns - cogs; profit (net profit) = grossProfit - expenses - salaries (payroll & commission) - stockLosses (damaged/lost stock adjustments); purchases = stock bought (not an expense in profit); position.payables = total the shop owes suppliers (payables list = per supplier); position.receivables = total customers owe the shop; accounts = current money balances.";
+const dayStart = (d: Date) => new Date(d.getFullYear(), d.getMonth(), d.getDate()).getTime();
+const addDays = (at: number, n: number) => at + n * 864e5;
+const month = (y: number, m: number) => new Date(y, m, 1).getTime();
+export function buildAssistantContext(s: ErpState, shop: string, currency: string): AssistantContext {
+  const now = new Date(), today = dayStart(now), week = today - ((now.getDay() + 6) % 7) * 864e5;
+  const ranges: [string, number, number][] = [
+    ["Today", today, Date.now()], ["Yesterday", today - 864e5, today - 1], ["This week", week, Date.now()], ["Last week", week - 7 * 864e5, week - 1],
+    ["This month", month(now.getFullYear(), now.getMonth()), Date.now()], ["Last month", month(now.getFullYear(), now.getMonth() - 1), month(now.getFullYear(), now.getMonth()) - 1],
+    ["This year", new Date(now.getFullYear(), 0, 1).getTime(), Date.now()], ["Last year", new Date(now.getFullYear() - 1, 0, 1).getTime(), new Date(now.getFullYear(), 0, 1).getTime() - 1], ["All time", 0, Date.now()],
+  ];
+  for (let i = 0; i < 6; i++) { const from = month(now.getFullYear(), now.getMonth() - i), to = month(now.getFullYear(), now.getMonth() - i + 1) - 1; ranges.push([new Date(from).toLocaleDateString("en", { month: "long", year: "numeric" }), from, Math.min(to, Date.now())]); }
+  const periods = ranges.map(([label, from, to]) => { const p = performance(s, from, to), pl = profitAndLoss(s, from, to), pt = purchaseTotals(s, from, to); const cats = new Map<string, number>(); s.expenses.filter((x) => x.at >= from && x.at <= to).forEach((x) => cats.set(x.category, (cats.get(x.category) ?? 0) + x.amount)); return { label, from, to, sales: p.sales, purchases: pt.purchases, expenses: pt.expenses, grossSales: pl.sales, salaries: pl.salaries, stockLosses: pl.stockAdj, profit: pl.net, grossProfit: pl.gross, cogs: pl.cogs, returns: p.returned, transactions: p.transactions, cash: p.byMethod.cash, mpesa: p.byMethod.mpesa, bank: p.byMethod.bank, credit: p.byMethod.credit, topProducts: p.top.map((x) => ({ label: x.name, value: x.value, secondary: x.qty })), expenseCategories: [...cats].sort((a, b) => b[1] - a[1]).slice(0, 12).map(([label, value]) => ({ label, value })) }; });
+  const pos = position(s), accounts = floatBalances(s);
+  return { definitions: DEFINITIONS, shop, currency, generatedAt: new Date().toISOString(), periods, position: { stock: pos.stock, retail: pos.retail, receivables: pos.receivables, payables: pos.payables, payroll: pos.payroll, low: pos.low, out: pos.out, cashUpPending: pos.cashUpPending }, accounts, products: s.products.slice(0, 1000).map((p) => ({ name: p.name, sku: p.sku, qty: p.qty, buy: p.buy, sell: p.sell, minStock: p.minStock ?? 0, hasImage: Boolean(p.image) })), receivables: s.customers.filter((x) => x.balance > 0).sort((a, b) => b.balance - a.balance).slice(0, 50).map((x) => ({ label: x.name, value: x.balance })), payables: s.suppliers.filter((x) => x.balance > 0).sort((a, b) => b.balance - a.balance).slice(0, 50).map((x) => ({ label: x.name, value: x.balance })), employees: s.employees.slice(0, 100).map((x) => ({ name: x.name, role: x.role, active: x.active })) };
+}
